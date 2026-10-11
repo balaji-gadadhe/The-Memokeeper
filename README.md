@@ -1,14 +1,87 @@
-# Hermes Discord Logger
+# The Memokeeper
 
-A small Discord bot that captures the messages **you** send in specified
-channels of a server and writes them to a JSON file with full metadata, plus
-keeps a processing-state file so your Hermes agent can tell new messages from
-ones it already handled.
+A Discord message logger for **asynchronous agent workflows** — capture your
+messages whenever you can be online, process them whenever your agent can be.
+
+## The problem it solves
+
+AI agent setups like **OpenClaw / Hermes-style assistants** usually rely on a
+Discord gateway that must stay online around the clock: the gateway is listening
+live to your channels, and every message is captured as it happens. That works
+fine on a dedicated server — but most of us run our agents on a **laptop that
+can't stay open 24/7**.
+
+Close the lid, and everything sent while your machine was offline is simply
+gone from your agent's memory. To catch a full day of messages, you'd have to
+leave the laptop powered and connected all day.
+
+**The Memokeeper changes that.** Discord itself persists your message
+history — so instead of keeping a gateway alive constantly, you:
+
+1. **Fire off messages through the day** from anywhere (phone, web, whatever)
+   into your tracked channels — whether or not the laptop is on.
+2. **When you're ready for your agent to work through everything**, open the
+   laptop and run the catch-up script once. It reads Discord's own history API
+   and pulls in everything that arrived while the machine was off.
+3. **Your agent then processes the full batch** through the reader, marks it
+   done, and you're caught up — with zero background processes running while
+   you don't need them.
+
+In short: **run one script and get your entire message history**, without ever
+needing your agent's gateway to be always-on. Nothing is lost because the
+gateway wasn't listening — Discord already remembers; Memokeeper just fetches
+what's yours.
+
+The live bot is still there (it captures in real time whenever you *do* have
+the laptop running), but it's an optimization, not a requirement.
+
+---
+
+## How it works
+
+```text
+                ┌────────────────────┐
+                │      Discord       │
+                └──────┬──────┬──────┘
+            live msgs  │      │ history API
+                       ▼      ▼
+              ┌─────────┐ ┌───────────┐
+              │ bot.py  │ │backfill.py│
+              │ (opt.)  │ │ (on boot) │
+              └────┬────┘ └─────┬─────┘
+                   │            │
+                   ▼            ▼
+        ┌───────────────────────────────┐
+        │            data/              │
+        │  messages.json  (all records) │
+        │  state.json  (cursor + marker)│
+        └───────────────┬───────────────┘
+                        │
+                        ▼
+              ┌─────────────────────┐
+              │   hermes_read.py    │
+              │  new → mark → done  │
+              └─────────────────────┘
+```
+
+- `bot.py` — **optional live capture.** Listens in your tracked channels and
+  stores your messages the moment you send them. If the laptop is open anyway,
+  this just keeps `messages.json` continuously fresh.
+- `backfill.py` — **the essential piece.** Whenever your laptop boots, it reads
+  each tracked channel's Discord history **newest-first** and stops at the
+  last message already stored (the **frontier**, from `state.json`). Only the
+  gap gets fetched — seconds, not minutes — and it's fully idempotent: run it
+  ten times, get zero duplicates.
+- `hermes_read.py` — **the reader your agent talks to.** Returns only records
+  newer than an export marker, hands them to the agent, and marks the batch
+  processed when the agent is done.
+
+Everything dedups on Discord's own `message_id` — never timestamps — so live
+capture and history backfill can't collide or double-store the same message.
 
 ## What gets stored
 
 `data/messages.json` — the source of truth. Each record looks like:
-
 ```json
 {
   "message_id": "123456789012345678",
@@ -28,8 +101,10 @@ ones it already handled.
 ```
 
 `data/state.json` — processing state: which message ids have been seen, the
-per-channel last-seen cursor, and a `last_export_at` epoch marker. Hermes
-uses the marker to ask for only *new* records since the last time it ran.
+per-channel last-seen cursor, and a `last_export_at` epoch marker. The reader
+uses the marker to return only *new* records since the last time it ran.
+
+---
 
 ## Setup
 
@@ -59,14 +134,20 @@ Edit `.env`:
 
 Do **not** commit the real `.env`.
 
-3. Run the bot:
+3. Run it:
 
+```bash
+run.bat            # Windows: catch-up + live bot in one click
 ```
-python bot.py
+or
+
+```bash
+python backfill.py # catch up offline gap
+python bot.py      # live capture (leave running, optional)
 ```
 
-On startup it reloads existing state from disk, so a restart won't duplicate
-messages. It flushes to disk periodically and on command.
+On startup everything reloads existing state from disk, so a restart won't
+duplicate messages. The bot flushes to disk periodically and on command.
 
 ## What the bot listens to
 
@@ -75,71 +156,46 @@ in `CHANNEL_CATEGORY_MAP`. Everything else is ignored.
 
 ## Owner commands (in any tracked channel, prefix `!`)
 
-- `!dump` — flush the in-memory buffer to disk and report counts by category.
-- `!export` — force an immediate write of messages.json.
-- `!stats` — show total stored, processed ids, and new-since-last-export count.
-- `!mark_exported` — set the `last_export_at` marker to now (tell Hermes
-  "everything up to now is handled").
+```text
+!dump            flush the in-memory buffer to disk, report counts by category
+!export          force an immediate write of messages.json
+!stats           total stored, processed ids, new-since-last-export count
+!mark_exported   set the export marker to now ("everything up to now is handled")
+```
 
-## How Hermes uses it
+## How your agent uses it
 
-The reader is `hermes_read.py`. The Hermes agent can call it in a few ways:
+The reader is `hermes_read.py`. Your agent can call it via CLI or import it as
+a module:
 
-- **Get only new records since last marker:**
-  `python hermes_read.py new`
-  This returns records whose `timestamp_epoch` is greater than the
-  `last_export_at` marker in `state.json`. On the first run (no marker),
-  it returns everything.
+```bash
+python hermes_read.py new                    # only new records since the marker
+python hermes_read.py new --json             # machine-readable output
+python hermes_read.py new --mark             # return new + mark batch processed
+python hermes_read.py dump                   # everything as JSON
+python hermes_read.py md                     # markdown digest (Obsidian-friendly)
+python hermes_read.py md --category tasks    # one category only
+python hermes_read.py categories             # list categories and counts
+python hermes_read.py bump                   # move marker to now manually
+python hermes_read.py bump --epoch 1735723200
+```
 
-- **Get new records, and mark them processed in one shot:**
-  `python hermes_read.py new --mark`
-  Use this when Hermes has actually finished working through the batch.
+The intended loop:
 
-- **Dump everything as JSON:**
-  `python hermes_read.py dump`
+1. Call `hermes_read.py new` (JSON mode if your agent parses it).
+2. Process the records (make notes, update tasks, etc.).
+3. Call `hermes_read.py new --mark` when the batch is done, so the next run
+   only sees newer messages.
 
-- **Markdown digest (good for Obsidian-style reading):**
-  `python hermes_read.py md`
-  Or one category: `python hermes_read.py md --category tasks`
+If your agent processes records out of order or in arbitrary batches, it can
+import `hermes_read` and call `add_processed_ids(...)` to mark specific ids
+handled without moving the time marker.
 
-- **List categories and counts:**
-  `python hermes_read.py categories`
+## Catch-up script (the reason this exists)
 
-- **Manually move the marker:**
-  `python hermes_read.py bump` (to now)
-  `python hermes_read.py bump --epoch 1735723200`
-
-The intended loop for Hermes:
-
-1. Call `hermes_read.py new` (JSON mode if you parse it).
-2. Process the returned records (make notes, update tasks, etc.).
-3. When the batch is done, call `hermes_read.py new --mark` so the next run
-   only sees newer messages. Or call `bump` with an explicit epoch if Hermes
-   processes up to a certain point.
-
-If Hermes processes records out of order or in arbitrary batches, it can also
-call `add_processed_ids` from its own code (import `hermes_read`) to mark
-specific message ids as handled without moving the time marker.
-
-## Edits
-
-If you edit a message, the bot updates the existing record in place (same
-`message_id`) rather than creating a duplicate. The record gets
-`is_edit: true` and an `edit_timestamp_utc`.
-
-## Adding more channels / categories
-
-Add entries to `CHANNEL_CATEGORY_MAP` in `bot.py` (or add more
-`DISCORD_CHANNEL_*` env vars and wire them in). Restart the bot after.
-
-## Catch-up script (for when your laptop isn't running 24/7)
-
-The live bot only captures messages as they happen. If your laptop is off for
-a while, messages sent in the meantime are missing from `messages.json`.
-
-Run the catch-up script to fill in the gap. It reads Discord message history
-for each tracked channel and appends only the messages that aren't already in
-the store, using `message_id` as the dedup key.
+The live bot only sees messages while the laptop is running. The catch-up
+script fills the offline gap — it reads each tracked channel's Discord history
+and appends only messages not already in the store, deduping on `message_id`.
 
 ### One-click run (Windows)
 
@@ -150,7 +206,7 @@ Double-click `run.bat` (or run it from a terminal). It does both steps for you:
 
 If you prefer to run the steps yourself:
 
-```
+```bash
 python backfill.py
 ```
 
@@ -158,52 +214,51 @@ What it does:
 
 - For each tracked channel, reads message history **newest-first**.
 - Stops at the first already-known message id (the per-channel frontier). The
-  frontier is taken from `state.json`'s `last_message_id_by_channel` when
-  present, otherwise derived from the newest id already in `messages.json` for
-  that channel. This means it catches up **only to the last saved message**, not
-  the entire history every time.
-- Appends only the missing messages, with the same record shape the live bot
-  uses (author_id, author_name, content, attachments, referenced_message_id,
-  timestamp_utc/epoch, message_id, category, channel_id).
-- Honors `DISCORD_ALLOWED_USERS`: only your messages are recorded; other users'
-  messages are walked past and marked seen so they aren't re-scanned next run.
-- After a successful backfill it updates `state.json`:
-  - adds every newly seen message id to `processed_ids`
-  - sets `last_message_id_by_channel` for each channel to the newest fetched id
-  - leaves `last_export_at` alone by default (Hermes decides when a batch is
-    processed)
+  frontier comes from `state.json`'s `last_message_id_by_channel` when present,
+  otherwise it is derived from the newest id already in `messages.json`. So it
+  catches up **only to the last saved message** — it never re-fetches the
+  whole history every time.
+- Appends only the missing messages, in the same record shape the live bot
+  uses.
+- Honors `DISCORD_ALLOWED_USERS`: only your messages are recorded; other
+  users' messages are walked past and marked seen so they aren't re-scanned.
+- Leaves `last_export_at` alone by default — the agent decides when a batch is
+  processed.
 
 The script is **idempotent**: run it again later and it adds nothing if there's
 no new history, and any messages that arrived in the gap are appended.
 
 ### Options
 
-- `--limit N` — fetch at most N missing messages per channel. Useful to avoid
-  hitting very large histories all at once; run it a few times to finish.
-- `--mark` — after backfill, also move the `last_export_at` marker to now so
-  Hermes treats the whole backfilled batch as processed on its next run.
-- `--dry-run` — load state and report what would be caught up without writing
-  anything.
+```text
+--limit N   fetch at most N missing messages per channel (batch large histories)
+--mark      after backfill, move the export marker to now so the agent
+            treats the whole backfilled batch as processed
+--dry-run   load state and report what would be caught up, write nothing
+```
 
 ### Typical workflow
 
-1. Boot the laptop, run the bot briefly or just run the catch-up script.
-2. `python backfill.py` — brings `messages.json` up to date with whatever
-   arrived while the bot was offline.
-3. If you also want Hermes to treat that whole batch as done immediately:
-   `python backfill.py --mark`.
-4. Then Hermes runs `python hermes_read.py new` to get anything new since the
-   marker, processes it, and calls `python hermes_read.py new --mark` when done.
+```bash
+# 1) Boot the laptop.
+# 2) Catch up everything that arrived while you were offline:
+python backfill.py
+# 3) (Optional) mark that whole batch as processed for the agent:
+python backfill.py --mark
+# 4) Agent works through the batch:
+python hermes_read.py new        # consume
+python hermes_read.py new --mark # done
+```
 
 ### Why this is safe
 
 - Dedup is by `message_id`, exactly — never by timestamp. If the same message
   appears in history again (e.g. re-scan), it's skipped.
-- The frontier is the newest already-stored id per channel, so a gap in history
-  (deleted messages, never-run-before, etc.) does not cause early stopping or
-  re-fetching of everything.
-- Records from the catch-up script use the same shape and paths as the live bot,
-  so `hermes_read.py` sees them identically.
+- The frontier is the newest already-stored id per channel, so a gap in
+  history (deleted messages, never-run-before, etc.) does not cause early
+  stopping or re-fetching of everything.
+- Records from the catch-up script use the same shape and paths as the live
+  bot, so the reader sees them identically.
 
 ## Edits
 
@@ -213,18 +268,27 @@ If you edit a message, the bot updates the existing record in place (same
 
 ## Adding more channels / categories
 
-Add entries to `CHANNEL_CATEGORY_MAP` in `bot.py` (or add more
-`DISCORD_CHANNEL_*` env vars and wire them in). Restart the bot after.
+Set one `DISCORD_CHANNEL_<NAME>` env var per channel you want tracked (the
+part after `CHANNEL_` becomes the category). Add the matching entry to
+`CHANNEL_CATEGORY_MAP` in `bot.py` and restart. The store location can be
+moved anywhere with `MEMOKEEPER_DATA_DIR`.## File layout
 
-## File layout
-
+```text
+bot.py           Discord bot (optional live capture)
+backfill.py      Catch-up importer (the essential piece)
+hermes_read.py   Reader/marker for your agent
+run.bat          One-click: catch-up + live bot (Windows)
+.env             confidential config (never committed)
+.env.example     template with placeholders
+data/            default store location (override with MEMOKEEPER_DATA_DIR)
+  messages.json    source of truth: all captured messages
+  state.json       processing state + export marker
+test_bot.py      pipeline tests
+test_backfill.py backfill frontier/dedup tests
 ```
-./bot.py              # Discord bot
-./hermes_read.py      # Reader/marker for the Hermes agent
-./backfill.py         # Catch-up importer (reads Discord history into messages.json)
-./.env                # confidential config (do not commit)
-./.env.example        # template
-./data/              # default store location (override with MEMOKEEPER_DATA_DIR)
-  messages.json       # source of truth: all captured messages
-  state.json          # processing state + export marker
+
+## Requirements
+
+```text
+Python 3.10+   discord.py   pytest (for the test suite)
 ```
