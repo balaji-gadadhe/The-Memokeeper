@@ -1,0 +1,12 @@
+# Confidential — never commit
+.env
+
+# Local data store (your message history; relocate with MEMOKEEPER_DATA_DIR)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
