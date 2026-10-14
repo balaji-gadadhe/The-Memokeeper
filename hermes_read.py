@@ -27,12 +27,24 @@ from typing import Iterable, List, Dict, Any
 # ---------------------------------------------------------------------------
 # Paths (must match bot.py)
 # ---------------------------------------------------------------------------
-# The store lives in ./data by default. Set MEMOKEEPER_DATA_DIR to relocate it.
-# Note: bot.py loads .env into the environment; this module reads the same env
-# var directly, so set it in .env or the process environment (not just here).
+# The store lives in ./data by default. Set MEMOKEEPER_DATA_DIR in .env (or the
+# environment) to relocate it anywhere you like (Obsidian vault, synced folder,
+# another drive, etc.).
 import os as _os
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# Load .env from project root if present (lightweight, no external dep) — same
+# logic as bot.py, so a value set only in .env works for standalone CLI runs too.
+_env_path = BASE_DIR / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _v = _line.split("=", 1)
+        _os.environ.setdefault(_k.strip(), _v.strip())
+
 DATA_DIR = Path(_os.environ.get("MEMOKEEPER_DATA_DIR", "").strip() or (BASE_DIR / "data")).expanduser()
 MESSAGES_PATH = DATA_DIR / "messages.json"
 STATE_PATH = DATA_DIR / "state.json"

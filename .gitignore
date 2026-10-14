@@ -3,6 +3,7 @@
 
 # Local data store (your message history; relocate with MEMOKEEPER_DATA_DIR)
 data/
+data_test/  # pytest sandboxes (tests would otherwise wipe real data/)
 
 # Python
 __pycache__/

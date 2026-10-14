@@ -17,12 +17,17 @@ from typing import AsyncIterator
 import pytest
 
 BASE_DIR = Path(__file__).resolve().parent
-# Derive the test store paths exactly like the runtime does, so a custom
-# MEMOKEEPER_DATA_DIR used on the pytest command line is honored too.
-DATA_DIR = Path(os.environ.get("MEMOKEEPER_DATA_DIR", "").strip() or (BASE_DIR / "data")).expanduser()
+# Derive the test store paths exactly like the runtime does. Defaults to an
+# ISOLATED data_test/ store so running pytest never deletes the real data/
+# files (that used to silently wipe captured messages). A MEMOKEEPER_DATA_DIR
+# passed on the pytest command line is still honored.
+DATA_DIR = Path(os.environ.get("MEMOKEEPER_DATA_DIR", "").strip() or (BASE_DIR / "data_test")).expanduser()
 MESSAGES_PATH = DATA_DIR / "messages.json"
 STATE_PATH = DATA_DIR / "state.json"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+# Publish the sandbox so backfill (imported below) computes the same paths
+# instead of defaulting to the real ./data store.
+os.environ.setdefault("MEMOKEEPER_DATA_DIR", str(DATA_DIR))
 
 os.environ.setdefault("DISCORD_TOKEN", "test")
 os.environ.setdefault("DISCORD_ALLOWED_USERS", "100000000000000001")
