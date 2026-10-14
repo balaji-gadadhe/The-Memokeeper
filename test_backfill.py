@@ -270,12 +270,35 @@ class TestBackfillTraversal:
             backfill_channel_history(fake_chan, "journal", known, frontier_id=None)
         )
         ids = [r["message_id"] for r in fetched]
-        # Other-user message 100 is walked and skipped (not recorded).
+        # Other-user message 100 is walked past (not recorded, and not marked
+        # seen -- non-user ids must never stop or mask the walk).
         assert ids == ["300", "200"]
         assert "100" not in ids
-        assert "100" in known  # still marked seen so we do not re-walk it
+        assert "100" not in known
         # newest is the newest *recorded* id (300), since 100 was skipped.
         assert newest == "300"
+
+    def test_known_bot_reply_does_not_mask_newer_notes(self):
+        # Regression: bot/human replies interleaved ABOVE the user's notes can
+        # be marked seen in an earlier run. They must never stop the walk or
+        # an unknown note below them would be silently skipped forever.
+        BOT = "777777777777777777"
+        # NOTE: FakeHistoryChannel takes OLDEST-FIRST input (it reverses for
+        # the walk). On Discord this reads newest-first: bot reply, 400, 300.
+        msgs = [
+            make_msg("300", epoch=2000),                  # user note, known
+            make_msg("400", epoch=3000),                  # user note, unknown
+            make_msg("bot1", author_id=BOT, epoch=4000),  # bot digest, seen
+        ]
+        fake_chan = FakeHistoryChannel("journal", msgs)
+        os.environ["DISCORD_ALLOWED_USERS"] = "100000000000000001"
+        known: set[str] = {"bot1", "300"}
+        fetched, newest = asyncio.run(
+            backfill_channel_history(fake_chan, "journal", known, frontier_id="300")
+        )
+        # Old buggy behavior broke at the bot reply and fetched nothing.
+        assert [r["message_id"] for r in fetched] == ["400"]
+        assert newest == "400"
 
     def test_limit_stops_after_N_missing(self):
         msgs = [

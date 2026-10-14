@@ -257,8 +257,9 @@ What it does:
   whole history every time.
 - Appends only the missing messages, in the same record shape the live bot
   uses.
-- Honors `DISCORD_ALLOWED_USERS`: only your messages are recorded; other
-  users' messages are walked past and marked seen so they aren't re-scanned.
+- Honors `DISCORD_ALLOWED_USERS`: only your messages are recorded, and only
+  your messages can stop the walk — bot replies and other people's messages
+  are passed over, so they can never mask a newer note below them.
 - Leaves `last_export_at` alone by default — the agent decides when a batch is
   processed.
 

@@ -293,24 +293,23 @@ async def backfill_channel_history(
     newest_recorded_id: str | None = None
     fetched_missing = 0
 
-    # newest_first (default): walk backward from the most recent message.
-    # The first already-known message we hit is the frontier; everything after
-    # it (older) is already captured, so we stop.
-    # channel.history() returns an AsyncIterator in discord.py.
+    # Walk newest-first. ONLY a known message from the tracked user (or the
+    # explicit frontier) stops the walk -- everything after it (older) has
+    # been captured. Bots and other humans post interleaved replies (daily
+    # digests, reactions) that can sit ABOVE newer user notes; letting their
+    # ids break the walk would silently mask those notes. So non-user
+    # messages are always passed over (cheap: just a few extra fetches).
+    allowed = os.environ.get("DISCORD_ALLOWED_USERS", "").strip()
     async for msg in channel.history(oldest_first=False, limit=None):
         mid = str(msg.id)
 
-        # Already captured (globally known, or exactly this channel's frontier)?
-        # Everything older is already stored; stop.
-        if mid in known_ids or mid == frontier_id:
+        if mid == frontier_id:
             break
-
-        # Honor the allowed-users filter: skip other users but still mark the
-        # id as seen so we do not re-walk past it next run.
-        allowed = os.environ.get("DISCORD_ALLOWED_USERS", "").strip()
         if allowed and str(msg.author.id) != allowed:
-            known_ids.add(mid)
             continue
+        # Already captured globally? Everything older is stored; stop.
+        if mid in known_ids:
+            break
 
         rec = record_from_message(msg, category)
         missing.append(rec)
