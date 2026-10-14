@@ -79,6 +79,40 @@ the laptop running), but it's an optimization, not a requirement.
 Everything dedups on Discord's own `message_id` — never timestamps — so live
 capture and history backfill can't collide or double-store the same message.
 
+### Visual trackers in chat
+
+The bot also leaves breadcrumbs right where the messages live:
+
+- 👀 — added the moment a tracked message is recorded in the store
+  (live capture or backfill).
+- ✅ — added when your agent has processed it. The reader has no Discord
+  session, so state.json stays the source of truth and the *bot* mirrors
+  `processed_ids` onto the channel next time it's online (on startup).
+- 🧭 Caught up — after each catch-up run, the bot posts/edits one pinned-
+  style marker **per tracked channel** showing the latest status. Next run
+  uses it as a bonus checkpoint (everything older than the marker was
+  already walked). The stored cursor in state.json remains the primary
+  frontier; the marker is the belt-and-braces fallback that survives even
+  a wiped state.json.
+
+### Month rotation
+
+The store is sharded by month so the reader never loads an unbounded file:
+
+```text
+data/
+  messages.json        current (newest) month only
+  months/
+    2026-09.json       sealed archive — written once, never touched again
+  state.json           cursors + processed ids + export marker (tiny)
+```
+
+The active file is promoted automatically the first time a message from a
+new month is stored. The reader skips whole month shards that provably
+predate the export marker, so reads stay fast no matter how the archive
+grows. Dedup is enforced at every layer (`message_id`), so shard boundaries
+can't create duplicates.
+
 ## What gets stored
 
 `data/messages.json` — the source of truth. Each record looks like:
@@ -277,14 +311,17 @@ moved anywhere with `MEMOKEEPER_DATA_DIR`.## File layout
 bot.py           Discord bot (optional live capture)
 backfill.py      Catch-up importer (the essential piece)
 hermes_read.py   Reader/marker for your agent
+store.py         Shared month-sharded storage layer (used by all three)
 run.bat          One-click: catch-up + live bot (Windows)
 .env             confidential config (never committed)
 .env.example     template with placeholders
 data/            default store location (override with MEMOKEEPER_DATA_DIR)
-  messages.json    source of truth: all captured messages
+  messages.json    active month's records (auto-promoted at month rollover)
+  months/          sealed YYYY-MM.json shards, older months
   state.json       processing state + export marker
 test_bot.py      pipeline tests
 test_backfill.py backfill frontier/dedup tests
+test_store.py    month-sharding/promotion/reader tests
 ```
 
 ## Requirements

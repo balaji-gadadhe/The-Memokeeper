@@ -1,14 +1,17 @@
 # Reader/marker for the Hermes agent.
 #
 # Two things Hermes cares about:
-#  1) A readable source of truth: data/messages.json (full metadata + content).
+#  1) A readable source of truth: the month-sharded store (see store.py).
+#     `messages.json` holds the newest month; older months live in
+#     data/months/YYYY-MM.json. Reads go through the shared store layer.
 #  2) A signal for "what is new since last time": the export marker in
-#     data/state.json (last_export_at epoch). Anything with timestamp_epoch
+#     state.json (last_export_at epoch). Anything with timestamp_epoch
 #     > marker is new.
 #
 # This module:
-#   - loads both files
-#   - yields new records (serves the "file it can read and process")
+#   - loads the store (whole history for md/dump, marker-aware subsets for new)
+#   - skips month shards that provably predate the marker (never reads
+#     thousands of old rows just to find 2 new ones)
 #   - can atomically bump the marker so the next run only sees newer stuff
 #   - can render a markdown digest for quick Obsidian-style reading
 #
@@ -24,70 +27,59 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List, Dict, Any
 
-# ---------------------------------------------------------------------------
-# Paths (must match bot.py)
-# ---------------------------------------------------------------------------
-# The store lives in ./data by default. Set MEMOKEEPER_DATA_DIR in .env (or the
-# environment) to relocate it anywhere you like (Obsidian vault, synced folder,
-# another drive, etc.).
-import os as _os
+import store
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Load .env from project root if present (lightweight, no external dep) — same
-# logic as bot.py, so a value set only in .env works for standalone CLI runs too.
-_env_path = BASE_DIR / ".env"
-if _env_path.exists():
-    for _line in _env_path.read_text(encoding="utf-8").splitlines():
-        _line = _line.strip()
-        if not _line or _line.startswith("#") or "=" not in _line:
-            continue
-        _k, _v = _line.split("=", 1)
-        _os.environ.setdefault(_k.strip(), _v.strip())
-
-DATA_DIR = Path(_os.environ.get("MEMOKEEPER_DATA_DIR", "").strip() or (BASE_DIR / "data")).expanduser()
-MESSAGES_PATH = DATA_DIR / "messages.json"
-STATE_PATH = DATA_DIR / "state.json"
+# Compatibility paths (single active file + monthly shards via store layer).
+DATA_DIR = store.resolve_data_dir()
+MESSAGES_PATH = store.active_path()
+STATE_PATH = store.state_path()
 
 
 # ---------------------------------------------------------------------------
-# IO
+# IO (thin wrappers; the real logic lives in store.py)
 # ---------------------------------------------------------------------------
 def load_json(path: Path, default):
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return default
+    return store.load_json(path, default)
 
 
 def save_json(path: Path, data):
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    store.save_json(path, data)
 
 
 # ---------------------------------------------------------------------------
 # Data access
 # ---------------------------------------------------------------------------
 def load_messages() -> List[Dict[str, Any]]:
-    return load_json(MESSAGES_PATH, [])
+    return store.load_messages()
 
 
 def load_state() -> Dict[str, Any]:
-    st = load_json(STATE_PATH, {"last_export_at": None, "processed_ids": [], "last_message_id_by_channel": {}})
+    st = store.load_state()
     return {
-        "last_export_at": st.get("last_export_at"),
-        "processed_ids": set(st.get("processed_ids", [])),
-        "last_message_id_by_channel": st.get("last_message_id_by_channel", {}),
+        "last_export_at": st["last_export_at"],
+        "processed_ids": st["processed_ids"],
+        "last_message_id_by_channel": st["last_message_id_by_channel"],
     }
 
 
+def _month(sr: str) -> str:
+    """'YYYY-MM' for an epoch cutoff (UTC)."""
+    return datetime.fromtimestamp(float(sr), tz=timezone.utc).strftime("%Y-%m")
+
+
 def new_records_since(epoch: int | float | None = None) -> List[Dict[str, Any]]:
-    """Return records newer than `epoch`.
+    """Return records newer than `epoch` (chronologically ascending).
 
     The export marker is the primary signal: only records whose
     timestamp_epoch is strictly greater than the marker are returned. This is
     the "what arrived since last time Hermes ran" signal.
+
+    Month shards older than the marker's month are skipped entirely: records
+    are bucketed by their own UTC month, so a shard for a month strictly
+    before the marker's month cannot contain anything newer than the marker.
+    This keeps reads bounded no matter how the archive grows.
 
     As a safety net for same-second collisions (two messages in the same
     wall-clock second, where an integer-second marker would otherwise hide
@@ -100,34 +92,43 @@ def new_records_since(epoch: int | float | None = None) -> List[Dict[str, Any]]:
     If epoch is None, read the export marker from state.json. When there is
     no marker yet, returns every record (first run).
     """
-    messages = load_messages()
-    if not messages:
-        return []
-
     marker = epoch
     if marker is None:
         state = load_state()
         marker = state.get("last_export_at")
 
-    if marker is None:
-        return messages
+    marker_float = float(marker) if marker is not None else None
 
-    marker_float = float(marker)
-    # If the supplied marker has sub-second precision, use the processed_ids
-    # safety net so a same-second record still shows up as new.
-    use_safety_net = marker_float != int(marker_float)
+    messages: List[Dict[str, Any]] = store.load_active()
+    if marker_float is None:
+        # First run: everything is new. Include every shard.
+        messages = store.load_messages()
+    else:
+        marker_month = _month(marker_float)
+        months_dir = store.months_dir()
+        shard_paths = sorted(months_dir.glob("*.json")) if months_dir.exists() else []
+        for shelf in shard_paths:
+            month = store.shard_month(shelf)
+            if month is None or month >= marker_month:
+                # This month *could* contain records newer than the marker.
+                messages = messages + store.load_json(shelf, [])
+
+    if not messages:
+        return []
+
+    use_safety_net = marker_float is not None and marker_float != int(marker_float)
 
     out = []
-    state = load_state()
-    processed = state.get("processed_ids", set())
-    for m in messages:
-        ts = m.get("timestamp_epoch", 0)
-        if ts > marker_float:
-            out.append(m)
-        elif use_safety_net and m.get("message_id") not in processed and ts >= marker_float:
+    processed = load_state().get("processed_ids", set()) if use_safety_net else set()
+    for msg in messages:
+        ts = msg.get("timestamp_epoch", 0)
+        if marker_float is None or ts > marker_float:
+            out.append(msg)
+        elif use_safety_net and msg.get("message_id") not in processed and ts >= marker_float:
             # Same-second edge case: timestamp equals the fractional marker
             # but this id was never marked processed, so treat as new.
-            out.append(m)
+            out.append(msg)
+    out.sort(key=lambda record: (record.get("timestamp_epoch", 0), str(record.get("message_id", ""))))
     return out
 
 
@@ -154,12 +155,8 @@ def bump_export_marker(epoch: int | float | None = None) -> float:
         epoch = float(epoch)
     state = load_state()
     state["last_export_at"] = epoch
-    # Persist state only; messages.json is the source of truth and untouched.
-    save_json(STATE_PATH, {
-        "last_export_at": state["last_export_at"],
-        "processed_ids": list(state["processed_ids"]),
-        "last_message_id_by_channel": state["last_message_id_by_channel"],
-    })
+    # Persist state only; the message store is the source of truth and untouched.
+    store.save_state(state)
     return epoch
 
 
@@ -174,11 +171,7 @@ def add_processed_ids(ids: Iterable[str]) -> None:
     before = len(state["processed_ids"])
     state["processed_ids"] |= set(ids)
     if len(state["processed_ids"]) != before:
-        save_json(STATE_PATH, {
-            "last_export_at": state["last_export_at"],
-            "processed_ids": list(state["processed_ids"]),
-            "last_message_id_by_channel": state["last_message_id_by_channel"],
-        })
+        store.save_state(state)
 
 
 # ---------------------------------------------------------------------------

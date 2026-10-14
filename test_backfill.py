@@ -120,11 +120,19 @@ class TestChannelFrontier:
         for p in (MESSAGES_PATH, STATE_PATH):
             if p.exists():
                 p.unlink()
+        md = DATA_DIR / "months"
+        if md.exists():
+            for q in md.glob("*.json"):
+                q.unlink()
 
     def teardown_method(self):
         for p in (MESSAGES_PATH, STATE_PATH):
             if p.exists():
                 p.unlink()
+        md = DATA_DIR / "months"
+        if md.exists():
+            for q in md.glob("*.json"):
+                q.unlink()
 
     def _state(self, cursor=None, processed_ids=None):
         return {
@@ -196,6 +204,10 @@ class TestBackfillTraversal:
         for p in (MESSAGES_PATH, STATE_PATH):
             if p.exists():
                 p.unlink()
+        md = DATA_DIR / "months"
+        if md.exists():
+            for q in md.glob("*.json"):
+                q.unlink()
 
     def test_newest_first_stops_at_frontier(self):
         # Channel has messages [oldest=100, 200, 300=frontier, 400, 500=newest].
@@ -299,6 +311,10 @@ class TestFullBackfillFlowHeadless:
         for p in (MESSAGES_PATH, STATE_PATH):
             if p.exists():
                 p.unlink()
+        md = DATA_DIR / "months"
+        if md.exists():
+            for q in md.glob("*.json"):
+                q.unlink()
 
     def teardown_method(self):
         for p in (MESSAGES_PATH, STATE_PATH):

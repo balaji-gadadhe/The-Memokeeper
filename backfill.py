@@ -38,27 +38,25 @@ import discord
 from discord.ext import commands
 
 # ---------------------------------------------------------------------------
-# Paths (must match bot.py / hermes_read.py)
+# Paths (shared month-sharded store; see store.py)
 # ---------------------------------------------------------------------------
-# The store lives in ./data by default. Set MEMOKEEPER_DATA_DIR to relocate it.
-# main() calls load_env() first, then re-resolves the paths via resolve_paths()
-# so a value set in .env takes effect for CLI runs too.
+import store  # loads .env itself; MEMOKEEPER_DATA_DIR respected at import
+
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 
 
 def resolve_paths() -> None:
-    """(Re)compute DATA_DIR / MESSAGES_PATH / STATE_PATH from the environment.
+    """(Re)point module globals at the shared store layer.
 
-    Called once at import (defaults) and again after load_env() so a value in
-    .env is picked up. bot.py/hermes_read.py use the same env var directly.
+    store loads .env on import, so a value in .env is honored for CLI runs
+    without extra ceremony. Kept for backward compatibility with anything
+    referencing backfill.DATA_DIR / MESSAGES_PATH / STATE_PATH.
     """
     global DATA_DIR, MESSAGES_PATH, STATE_PATH
-    DATA_DIR = Path(
-        os.environ.get("MEMOKEEPER_DATA_DIR", "").strip() or (BASE_DIR / "data")
-    ).expanduser()
-    MESSAGES_PATH = DATA_DIR / "messages.json"
-    STATE_PATH = DATA_DIR / "state.json"
+    DATA_DIR = store.resolve_data_dir()
+    MESSAGES_PATH = store.active_path()
+    STATE_PATH = store.state_path()
 
 
 resolve_paths()
@@ -146,35 +144,24 @@ def record_from_message(message: discord.Message, category: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# State helpers
+# State helpers (delegated to the shared store layer; see store.py)
 # ---------------------------------------------------------------------------
 def load_state():
-    st = load_json(STATE_PATH, {
-        "last_message_id_by_channel": {},
-        "last_export_at": None,
-        "processed_ids": [],
-    })
-    return {
-        "last_message_id_by_channel": st.get("last_message_id_by_channel", {}),
-        "last_export_at": st.get("last_export_at"),
-        "processed_ids": set(st.get("processed_ids", [])),
-    }
+    return store.load_state()
 
 
 def save_state(state):
-    save_json(STATE_PATH, {
-        "last_message_id_by_channel": state["last_message_id_by_channel"],
-        "last_export_at": state["last_export_at"],
-        "processed_ids": list(state["processed_ids"]),
-    })
+    store.save_state(state)
 
 
 def load_messages():
-    return load_json(MESSAGES_PATH, [])
+    # Includes month shards (store handles dedupe + ordering).
+    return store.load_messages()
 
 
 def save_messages(messages):
-    save_json(MESSAGES_PATH, messages)
+    # Sharded write: newest month -> messages.json, older months -> months/.
+    return store.save_all(messages)
 
 
 # ---------------------------------------------------------------------------
@@ -222,12 +209,68 @@ def already_known_message_ids(messages, state):
 # ---------------------------------------------------------------------------
 # Backfill logic
 # ---------------------------------------------------------------------------
+MARKER_PREFIX = "🧭 Caught up"
+
+
+def is_marker_message(msg, bot_id: int) -> bool:
+    """True if this message is one of our 🧭 Caught-up tracker markers."""
+    return (
+        msg.author is not None
+        and msg.author.id == bot_id
+        and (msg.content or "").startswith(MARKER_PREFIX)
+    )
+
+
+async def find_latest_marker(channel, bot_id: int):
+    """Return the newest 🧭 marker message in the channel, or None.
+
+    history() walks newest-first, so the first match is the latest marker.
+    The scan window is small (recent messages only) because the marker is
+    edited in place every run -- it should always sit near the top.
+    """
+    try:
+        async for m in channel.history(oldest_first=False, limit=50):
+            if is_marker_message(m, bot_id):
+                return m
+    except Exception as e:
+        log.warning("Marker scan failed in #%s: %s", getattr(channel, 'name', channel), e)
+    return None
+
+
+def marker_text(channel_name: str, new_count: int, category: str, total_records: int, frontier: str | None) -> str:
+    """Body of the 🧭 Caught-up tracker message (status, not a data record)."""
+    when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    line = f"{MARKER_PREFIX} — {when}\n"
+    line += f"#{channel_name} [{category}]: +{new_count} new this run"
+    if frontier:
+        line += f" · cursor `{frontier}`"
+    line += f"\nStore total: {total_records} records ✔ (this message is the catch-up checkpoint; the bot edits it every run)"
+    return line
+
+
+async def post_or_edit_marker(channel, bot, text: str) -> None:
+    """Edit the existing marker in place (chat stays clean) or post + pin one."""
+    existing = await find_latest_marker(channel, bot.user.id)
+    try:
+        if existing is not None:
+            await existing.edit(content=text)
+        else:
+            marker = await channel.send(text)
+            try:
+                await marker.pin()
+            except Exception as e:
+                log.warning("Could not pin marker in #%s (ok, cosmetic): %s", channel.name, e)
+    except Exception as e:
+        log.warning("Could not post marker in #%s: %s", channel.name, e)
+
+
 async def backfill_channel_history(
     channel: discord.TextChannel,
     category: str,
     known_ids: set[str],
     frontier_id: str | None,
     limit: int | None = None,
+    react: bool = False,
 ) -> tuple[list[dict], str | None]:
     """Read history for one channel and return (missing_records, newest_id_seen).
 
@@ -273,6 +316,12 @@ async def backfill_channel_history(
         missing.append(rec)
         known_ids.add(mid)
         fetched_missing += 1
+        # 👀 "noted" -- visual tracker that this message is in the store.
+        if react:
+            try:
+                await msg.add_reaction("👀")
+            except Exception as e:
+                log.warning("Could not react 👀 to %s: %s", mid, e)
         # Track the newest recorded id (string comparison of numeric ids works).
         if newest_recorded_id is None or mid > newest_recorded_id:
             newest_recorded_id = mid
@@ -349,12 +398,24 @@ async def do_backfill(bot, category_map, args):
             continue
 
         ch_frontier_id = frontier.get(str(channel_id))
+        if ch_frontier_id is None:
+            # No stored cursor for this channel (never run here, or state.json
+            # was wiped). Fall back to the channel's 🧭 marker message as the
+            # checkpoint: everything older than it was walked in a previous
+            # run, so stopping there is safe. The stored cursor stays the
+            # primary source of truth; the marker is the belt-and-braces
+            # fallback.
+            marker = await find_latest_marker(channel, bot.user.id)
+            if marker is not None:
+                ch_frontier_id = str(marker.id)
+                log.info("No cursor for #%s — using 🧭 marker at %s as frontier.", channel.name, ch_frontier_id)
         new_recs, newest_id = await backfill_channel_history(
             channel,
             category,
             known_ids,
             ch_frontier_id,
             limit=args.limit,
+            react=True,
         )
 
         if new_recs:
@@ -385,7 +446,7 @@ async def do_backfill(bot, category_map, args):
                 frontier.get(str(channel_id)),
             )
 
-    # Persist everything atomically.
+    # Persist everything atomically (month-sharded; see store.py).
     save_messages(messages)
 
     # Update state: seed processed_ids with every id we now know about and
@@ -398,6 +459,24 @@ async def do_backfill(bot, category_map, args):
         if res["newest_message_id"]:
             state["last_message_id_by_channel"][ch_id_str] = res["newest_message_id"]
     save_state(state)
+
+    # 🧭 Chat trackers: post/edit the marker in every tracked channel so the
+    # catch-up checkpoint is visually right where the messages live. The bot
+    # edits its existing marker in place each run instead of spamming new ones.
+    total_records = len(load_messages())
+    for channel_id, category in category_map.items():
+        channel = bot.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        res = per_channel_result.get(str(channel_id), {})
+        text = marker_text(
+            channel.name or str(channel_id),
+            res.get("new_count", 0),
+            category,
+            total_records,
+            res.get("newest_message_id") or frontier.get(str(channel_id)),
+        )
+        await post_or_edit_marker(channel, bot, text)
 
     log.info("Backfill complete. Total new messages added: %d", total_new)
     if SYS_LOG_CHANNEL_ID:

@@ -28,17 +28,14 @@ import discord
 from discord.ext import commands
 
 # ----------------------------------------------------------------------------
-# Paths
+# Paths (shared month-sharded store; see store.py)
 # ----------------------------------------------------------------------------
-# The store lives in ./data by default. Set MEMOKEEPER_DATA_DIR in .env (or the
-# environment) to relocate it anywhere you like (a synced folder, another drive,
-# etc.). Env overrides are applied before this point (see load_env above).
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("MEMOKEEPER_DATA_DIR", "").strip() or (BASE_DIR / "data")).expanduser()
-MESSAGES_PATH = DATA_DIR / "messages.json"
-STATE_PATH = DATA_DIR / "state.json"
+import store  # resolves MEMOKEEPER_DATA_DIR (loads .env itself too)
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = store.resolve_data_dir()
+MESSAGES_PATH = store.active_path()
+STATE_PATH = store.state_path()
 
 # ----------------------------------------------------------------------------
 # Logging
@@ -84,7 +81,7 @@ def load_json(path: Path, default):
 
 
 def save_json(path: Path, data):
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    store.save_json(path, data)
 
 
 def slugify_category(cat: str) -> str:
@@ -107,23 +104,25 @@ messages = []  # in-memory buffer; persisted periodically + on export
 
 def reload_state():
     global state, messages
-    st = load_json(STATE_PATH, {"last_message_id_by_channel": {}, "last_export_at": None, "processed_ids": []})
+    st = store.load_state()
     state = {
-        "last_message_id_by_channel": st.get("last_message_id_by_channel", {}),
-        "last_export_at": st.get("last_export_at"),
-        "processed_ids": set(st.get("processed_ids", [])),
+        "last_message_id_by_channel": st["last_message_id_by_channel"],
+        "last_export_at": st["last_export_at"],
+        "processed_ids": st["processed_ids"],
     }
-    ms = load_json(MESSAGES_PATH, [])
-    messages = ms
+    # Memory holds ALL records across every month shard, so edits and stats
+    # keep working on older messages even after rotation splits files.
+    messages = store.load_messages()
 
 
 def persist_now():
-    save_json(STATE_PATH, {
+    # Sharded write: newest month -> messages.json, older months -> months/.
+    store.save_all(messages)
+    store.save_state({
         "last_message_id_by_channel": state["last_message_id_by_channel"],
         "last_export_at": state["last_export_at"],
-        "processed_ids": list(state["processed_ids"]),
+        "processed_ids": state["processed_ids"],
     })
-    save_json(MESSAGES_PATH, messages)
 
 
 async def send_sys(message: str, channel_id: int):
@@ -138,6 +137,55 @@ async def send_sys(message: str, channel_id: int):
 
 
 # ----------------------------------------------------------------------------
+# Reaction reconciliation (👀 = recorded, ✅ = Hermes processed it)
+# ----------------------------------------------------------------------------
+PROCESSED_EMOJI = "✅"
+
+
+async def reconcile_reactions(scan_limit: int = 100):
+    """Catch up on ✅ marks for messages Hermes already processed.
+
+    hermes_read.py has no Discord session, so it cannot react at process
+    time. Instead the bot mirrors state.json onto the channel: any tracked
+    message whose id is in processed_ids gets ✅ added (👀 remains --
+    recorded). Reactions may drift (deleted messages, offline weeks),
+    which is fine: state.json is the source of truth, reactions are only
+    the visual layer.
+    """
+    processed = state.get("processed_ids", set())
+    if not processed:
+        return
+    marked = 0
+    for ch_id in CHANNEL_CATEGORY_MAP:
+        ch = bot.get_channel(ch_id)
+        if not isinstance(ch, discord.TextChannel):
+            continue
+        if TARGET_SERVER_ID and ch.guild and ch.guild.id != TARGET_SERVER_ID:
+            continue
+        try:
+            history = ch.history(limit=scan_limit)
+            async for msg in history:
+                if msg.author.bot:
+                    continue
+                if ALLOWED_USER_ID and str(msg.author.id) != ALLOWED_USER_ID.strip():
+                    continue
+                if str(msg.id) not in processed:
+                    continue
+                already = any(r.emoji == PROCESSED_EMOJI and r.me for r in msg.reactions)
+                if already:
+                    continue
+                try:
+                    await msg.add_reaction(PROCESSED_EMOJI)
+                    marked += 1
+                except Exception as e:
+                    log.warning("Could not react ✅ to %s in #%s: %s", msg.id, ch.name, e)
+        except Exception as e:
+            log.warning("Reaction sync failed for %s: %s", ch, e)
+    if marked:
+        log.info("Marked ✅ on %d processed message(s)", marked)
+
+
+# ----------------------------------------------------------------------------
 # Event handlers
 # ----------------------------------------------------------------------------
 @bot.event
@@ -146,6 +194,10 @@ async def on_ready():
     reload_state()
     log.info("Loaded state: %d processed ids, %d messages in store", len(state["processed_ids"]), len(messages))
     await send_sys(f"Reconnected. Tracking {len(CHANNEL_CATEGORY_MAP)} category channels.", SYS_LOG_CHANNEL_ID)
+    # ✅ reconciliation: reactions are a visual mirror of state.json's
+    # processed_ids, not the source of truth. Anything Hermes already handled
+    # gets its ✅ here, including backfilled gaps from previous offline runs.
+    await reconcile_reactions()
 
 
 @bot.event
@@ -200,6 +252,12 @@ async def on_message(message: discord.Message):
     # Periodic flush every ~20 saved messages or every 30s (handled below)
     if len(messages) % 20 == 0:
         persist_now()
+
+    # 👀 "noted" reaction: this message was captured in the store.
+    try:
+        await message.add_reaction("👀")
+    except Exception as e:
+        log.warning("Could not react 👀 to %s: %s", msg_id, e)
 
     log.info(
         "Captured [%s] %s #%s: %s",

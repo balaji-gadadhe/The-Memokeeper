@@ -59,6 +59,12 @@ def clean_store():
         for p in DATA_DIR.iterdir():
             if p.is_file():
                 p.unlink()
+    # Also clear month shards (store.py sandbox layout) so nothing leaks
+    # across suites sharing this sandbox.
+    months_dir = DATA_DIR / "months"
+    if months_dir.exists():
+        for p in months_dir.glob("*.json"):
+            p.unlink()
 
 
 def make_record(msg_id, category, content, epoch=None, author="you"):
