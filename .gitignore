@@ -5,6 +5,18 @@
 data/
 data_test/  # pytest sandboxes (tests would otherwise wipe real data/)
 
+# Hermes / personal agent workspace — PRIVATE, never goes to the public repo
+*hermes*
+*Hermes*
+catchup.js
+*Obsidian*
+The-Memokeeper.md   # personal Obsidian reference note (local paths inside)
+package.json        # belongs to private catchup.js tooling
+package-lock.json
+
+# Node
+node_modules/
+
 # Python
 __pycache__/
 *.py[cod]
