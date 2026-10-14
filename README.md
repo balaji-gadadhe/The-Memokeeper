@@ -88,12 +88,15 @@ The bot also leaves breadcrumbs right where the messages live:
 - ✅ — added when your agent has processed it. The reader has no Discord
   session, so state.json stays the source of truth and the *bot* mirrors
   `processed_ids` onto the channel next time it's online (on startup).
-- 🧭 Caught up — after each catch-up run, the bot posts/edits one pinned-
-  style marker **per tracked channel** showing the latest status. Next run
-  uses it as a bonus checkpoint (everything older than the marker was
-  already walked). The stored cursor in state.json remains the primary
-  frontier; the marker is the belt-and-braces fallback that survives even
-  a wiped state.json.
+- 🧭 Caught up — **only in channels that actually caught messages** that run,
+  the bot posts one short checkpoint:
+  `🧭 Caught up on the last 3 notes in #journal · 2026-10-14 16:27 UTC`
+  It is edited in place on repeat runs (no spam, one line per channel).
+  Idle channels keep no checkpoint; a stale one there gets removed.
+  Next run can use the checkpoint as a bonus frontier (everything older
+  than it was already walked). The stored cursor in state.json remains
+  the primary frontier; the marker is the belt-and-braces fallback that
+  survives even a wiped state.json.
 
 ### Month rotation
 

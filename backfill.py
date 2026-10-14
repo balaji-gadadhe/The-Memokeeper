@@ -237,15 +237,15 @@ async def find_latest_marker(channel, bot_id: int):
     return None
 
 
-def marker_text(channel_name: str, new_count: int, category: str, total_records: int, frontier: str | None) -> str:
-    """Body of the 🧭 Caught-up tracker message (status, not a data record)."""
+def marker_text(channel_name: str, new_count: int) -> str:
+    """Body of the 🧭 Caught-up tracker message -- short and scannable.
+
+    e.g.  "🧭 Caught up on the last 3 notes in #journal · 2026-10-14 16:27 UTC"
+    Only ever posted for channels that actually caught messages this run.
+    """
     when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    line = f"{MARKER_PREFIX} — {when}\n"
-    line += f"#{channel_name} [{category}]: +{new_count} new this run"
-    if frontier:
-        line += f" · cursor `{frontier}`"
-    line += f"\nStore total: {total_records} records ✔ (this message is the catch-up checkpoint; the bot edits it every run)"
-    return line
+    word = "note" if new_count == 1 else "notes"
+    return f"{MARKER_PREFIX} on the last {new_count} {word} in #{channel_name} · {when}"
 
 
 async def post_or_edit_marker(channel, bot, text: str) -> None:
@@ -460,23 +460,27 @@ async def do_backfill(bot, category_map, args):
             state["last_message_id_by_channel"][ch_id_str] = res["newest_message_id"]
     save_state(state)
 
-    # 🧭 Chat trackers: post/edit the marker in every tracked channel so the
-    # catch-up checkpoint is visually right where the messages live. The bot
-    # edits its existing marker in place each run instead of spamming new ones.
-    total_records = len(load_messages())
+    # 🧭 Chat checkpoints appear ONLY in channels that actually caught
+    # messages this run, so idle channels never look spammy. The checkpoint
+    # is edited in place on repeat runs. Channels with nothing to catch up
+    # keep no checkpoint: a stale one there gets removed.
     for channel_id, category in category_map.items():
         channel = bot.get_channel(channel_id)
         if not isinstance(channel, discord.TextChannel):
             continue
         res = per_channel_result.get(str(channel_id), {})
-        text = marker_text(
-            channel.name or str(channel_id),
-            res.get("new_count", 0),
-            category,
-            total_records,
-            res.get("newest_message_id") or frontier.get(str(channel_id)),
-        )
-        await post_or_edit_marker(channel, bot, text)
+        new_count = res.get("new_count", 0)
+        if new_count > 0:
+            text = marker_text(channel.name or str(channel_id), new_count)
+            await post_or_edit_marker(channel, bot, text)
+        else:
+            stale = await find_latest_marker(channel, bot.user.id)
+            if stale is not None:
+                try:
+                    await stale.delete()
+                    log.info("Removed stale 🧭 checkpoint from idle channel #%s.", channel.name)
+                except Exception as e:
+                    log.warning("Could not remove stale checkpoint in #%s: %s", channel.name, e)
 
     log.info("Backfill complete. Total new messages added: %d", total_new)
     if SYS_LOG_CHANNEL_ID:

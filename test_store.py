@@ -186,13 +186,16 @@ class TestMarkerHelpers:
         assert not is_marker_message(FakeMsg(4, None, "🧭 Caught up"), self.BOT_ID)
 
     def test_marker_text_contains_status(self):
-        text = marker_text("journal", 3, "journal", 24, "12345")
+        text = marker_text("journal", 3)
         assert text.startswith("🧭 Caught up")
-        assert "+3 new" in text
-        assert "12345" in text
-        assert "24 records" in text
-
-    def test_marker_text_without_cursor(self):
-        text = marker_text("journal", 0, "journal", 10, None)
-        assert text.startswith("🧭 Caught up")
+        assert "last 3 notes" in text
+        assert "#journal" in text
+        # Keeps it short: no cursor hashes, no store totals, no boilerplate.
         assert "cursor" not in text
+        assert "records" not in text
+        assert text.count("\n") == 0
+
+    def test_marker_text_singular_note(self):
+        text = marker_text("journal", 1)
+        assert "last 1 note" in text
+        assert "notes" not in text
