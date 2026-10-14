@@ -32,7 +32,7 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord.ext import commands
@@ -237,31 +237,41 @@ async def find_latest_marker(channel, bot_id: int):
     return None
 
 
+IST = timezone(timedelta(hours=5, minutes=30))  # Asia/Kolkata; no DST
+
+
 def marker_text(channel_name: str, new_count: int) -> str:
     """Body of the 🧭 Caught-up tracker message -- short and scannable.
 
-    e.g.  "🧭 Caught up on the last 3 notes in #journal · 2026-10-14 16:27 UTC"
+    e.g.  "🧭 Caught up on the last 3 notes in #journal · 2026-10-14 21:57 IST"
     Only ever posted for channels that actually caught messages this run.
     """
-    when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    when = datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
     word = "note" if new_count == 1 else "notes"
     return f"{MARKER_PREFIX} on the last {new_count} {word} in #{channel_name} · {when}"
 
 
 async def post_or_edit_marker(channel, bot, text: str) -> None:
-    """Edit the existing marker in place (chat stays clean) or post + pin one."""
+    """Send a FRESH checkpoint, removing any previous one first.
+
+    Result: exactly one checkpoint line per active channel, at the bottom,
+    right under the newest notes -- and a brand-new line every live run so
+    the tracked moment is obvious (previous silent edits were easy to miss).
+    """
     existing = await find_latest_marker(channel, bot.user.id)
+    if existing is not None:
+        try:
+            await existing.delete()
+        except Exception as e:
+            log.warning("Could not remove previous checkpoint in #%s: %s", channel.name, e)
     try:
-        if existing is not None:
-            await existing.edit(content=text)
-        else:
-            marker = await channel.send(text)
-            try:
-                await marker.pin()
-            except Exception as e:
-                log.warning("Could not pin marker in #%s (ok, cosmetic): %s", channel.name, e)
+        marker = await channel.send(text)
+        try:
+            await marker.pin()
+        except Exception as e:
+            log.warning("Could not pin checkpoint in #%s (ok, cosmetic): %s", channel.name, e)
     except Exception as e:
-        log.warning("Could not post marker in #%s: %s", channel.name, e)
+        log.warning("Could not post checkpoint in #%s: %s", channel.name, e)
 
 
 async def backfill_channel_history(

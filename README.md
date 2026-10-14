@@ -89,9 +89,11 @@ The bot also leaves breadcrumbs right where the messages live:
   session, so state.json stays the source of truth and the *bot* mirrors
   `processed_ids` onto the channel next time it's online (on startup).
 - 🧭 Caught up — **only in channels that actually caught messages** that run,
-  the bot posts one short checkpoint:
-  `🧭 Caught up on the last 3 notes in #journal · 2026-10-14 16:27 UTC`
-  It is edited in place on repeat runs (no spam, one line per channel).
+  the bot posts a short checkpoint right under your newest notes:
+  `🧭 Caught up on the last 3 notes in #journal · 2026-10-14 21:57 IST`
+  Times are IST (Asia/Kolkata) and a **fresh** line is sent every run —
+  the previous checkpoint is removed first, so a channel always has at
+  most one, always at the bottom, always current.
   Idle channels keep no checkpoint; a stale one there gets removed.
   Next run can use the checkpoint as a bonus frontier (everything older
   than it was already walked). The stored cursor in state.json remains
